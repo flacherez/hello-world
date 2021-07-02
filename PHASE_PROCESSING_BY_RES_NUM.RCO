@@ -47,7 +47,7 @@ configuration section.
 source-computer.   VAX.
 object-computer.   VAX.
 special-names.
- 	SYMBOLIC CHARACTERS FF IS 13.
+	SYMBOLIC CHARACTERS FF IS 13.
 
 input-output section.
 file-control.
@@ -303,6 +303,8 @@ COPY "RES$CDD.LINKREC.RECALC_RESINT_PCTS_LKG" FROM DICTIONARY.
 /
 COPY "COM$CDD.LINKREC.GLOBAL_PARAM_LKG" FROM DICTIONARY.
 /
+COPY "COM$CDD.LINKREC.GET_CFD_PARCEL_LKG" FROM DICTIONARY.
+/
 *
 *   local work area values
 *
@@ -439,6 +441,9 @@ COPY "COM$CDD.LINKREC.GLOBAL_PARAM_LKG" FROM DICTIONARY.
 01  WS_RESTART_FOUND_FLG		PIC X.
 
 01  WS_LETTER_REC_LEN			PIC 9(4) COMP.
+
+01  WS_CFD_CANCEL_FLG			PIC X.
+01  WS_CFD_NEW_CNT			PIC 9(4) COMP.
 
 /
 *********************
@@ -966,6 +971,7 @@ COPY "COBOL$COPYLIB:RES_PHASE_HDR_DATA".
 01  BLANK_LINE				PIC X(132) VALUE SPACES.
 
 01  WS_CFD_COUNT                        PIC 9(9).
+01  CFD_IX				PIC 9(4).
 
 01  WS_TODAY_ANSI                       PIC S9(11)V9(7) COMP.
 
@@ -1832,6 +1838,7 @@ BUILD_RES_NUM_TABLE.
 		WRITE RES_NUM_WORK_REC.
 	CLOSE RES_NUM_WORK_FIL.
 	DISPLAY "TOTAL PARCEL COUNT TO PROCESS IS " WS_PARCEL_COUNT_TOT.
+	DISPLAY " ".
 
 *  Code was implemented to process splits/combines differently from other types
 *  of resolutions due to the re-application of payments.  These are identified
@@ -1970,6 +1977,102 @@ CFR_TRAN.
 	DISPLAY " ".
 
 CHECK_FOR_RESTART_EXIT.
+	EXIT.
+
+/
+*********************
+* CHECK_PARCEL_CFDS *
+*********************
+
+CHECK_PARCEL_CFDS.
+
+* This parcel in the phase is associated with one or more CFD districts.
+* We want to see if there is a situation where this parcel is being
+* cancelled (NEW_ASSESSED_TAX = 0.00) and that the same CFD is not
+* associated with any new parcels being created by the same resolution.
+*
+* If we see this situation, then the WS_CFD_CANCEL_FLG will be set to "Y"
+* and the resolution will be disapproved.
+
+
+* This call retrieves all the CFD districts associated with the 
+* specified parcel # and tax year.
+
+	MOVE PARCEL_BOOK_MAP_ITEM IN RES_PHASE_LIST_REC TO
+		PARCEL_BOOK_MAP_ITEM IN GET_CFD_PARCEL_LKG.
+	MOVE PARCEL_SPLIT IN RES_PHASE_LIST_REC TO
+		PARCEL_SPLIT IN GET_CFD_PARCEL_LKG.
+	MOVE TAX_YEAR IN RES_PHASE_LIST_REC TO
+		TAX_YEAR IN GET_CFD_PARCEL_LKG.
+	CALL "GET_CFD_PARCEL" USING GET_CFD_PARCEL_LKG
+		GIVING RETURN_STATUS.
+	IF RETURN_STATUS < 1 THEN
+		IF RDB_DEADLOCK THEN
+			GO TO CHECK_PARCEL_CFDS_EXIT
+		END-IF
+		GO TO HANDLE_ERRORS
+	END-IF.
+
+* Spin through the CFD districts associated with this parcel.  For each
+* CFD district, see if it is also being associated with any new parcels being
+* created in the same resolution number.
+
+	MOVE 1 TO CFD_IX.
+	MOVE "N" TO WS_CFD_CANCEL_FLG.
+
+CHECK_PARCEL_CFD_LOOP.
+
+	IF CFD_IX > CFD_DIST_COUNT IN GET_CFD_PARCEL_LKG THEN
+		GO TO CHECK_PARCEL_CFDS_EXIT
+	END-IF.
+
+	IF REMOVED_FLG IN GET_CFD_PARCEL_LKG(CFD_IX) = "Y" THEN
+		ADD 1 TO CFD_IX
+		GO TO CHECK_PARCEL_CFD_LOOP
+	END-IF.
+
+&RDB&	GET
+&RDB&	    ON ERROR
+		CALL "CHK_RDB_ERROR" USING RDB$STATUS GIVING RETURN_STATUS
+		IF RDB_DEADLOCK
+			GO TO CHECK_PARCEL_CFDS_EXIT
+		END-IF
+		MOVE "ERROR IN CFD_NEW_CNT GET" TO ERR_FUNCTION_DETAIL
+		GO TO RDB_ERROR
+&RDB&	    END_ERROR
+&RDB&	  WS_CFD_NEW_CNT = COUNT OF R IN RES_PHASE_LIST CROSS
+&RDB&				    C IN CFD_PARCEL WITH
+&RDB&			R.TAX_YEAR = WS_RES_YEAR AND
+&RDB&			R.RES_PHASE_NUM = WS_PHASE_NUM AND
+&RDB&			R.VALID_FLG = "Y" AND
+&RDB&			R.NEW_PARCEL_FLG = "Y" AND
+&RDB&			R.RES_NUM = WS_CURR_RES_NUM AND
+&RDB&			R.PARCEL_BOOK_MAP_ITEM = C.PARCEL_BOOK_MAP_ITEM AND
+&RDB&			R.PARCEL_SPLIT = C.PARCEL_SPLIT AND
+&RDB&			R.TAX_YEAR = C.TAX_YEAR AND
+&RDB&			C.DIST = DIST IN GET_CFD_PARCEL_LKG(CFD_IX) AND
+&RDB&			C.ASSESS_AMT > 0 AND
+&RDB&			C.REMOVED_FLG = "N"
+&RDB&	END_GET
+
+* If the parcel we're checking here is being cancelled by the resolution,
+* is associated with a CFD district, and there is no assessment for the
+* same CFD district being assessed on new parcels in the same resolution,
+* then we have a problem here.  Set the WS_CFD_CANCEL_FLG to "Y" to
+* indicate the condition.
+
+	IF ORIG_ASSESSED_TAX IN RES_PHASE_LIST_REC > 0 AND
+	   NEW_ASSESSED_TAX IN RES_PHASE_LIST_REC = 0 AND
+	   WS_CFD_NEW_CNT = 0 THEN
+		MOVE "Y" TO WS_CFD_CANCEL_FLG
+		GO TO CHECK_PARCEL_CFDS_EXIT
+	END-IF.
+
+	ADD 1 TO CFD_IX.
+
+	GO TO CHECK_PARCEL_CFD_LOOP.
+
+CHECK_PARCEL_CFDS_EXIT.
 	EXIT.
 
 /
@@ -2650,17 +2753,20 @@ GET_PARCEL_DATA.
 &RDB&                      C.REMOVED_FLG = "N"
 &RDB& END_GET
 
-    IF WS_CFD_COUNT > 0 THEN
-        IF ORIG_ASSESSED_TAX IN RES_PHASE_LIST_REC > 0 AND
-           NEW_ASSESSED_TAX IN RES_PHASE_LIST_REC = 0 THEN
-            MOVE "CANNOT CANCEL CFD TAX" TO WS_EXCEPTION_TXT
-            DISPLAY "CANNOT CANCEL CFD TAX FOR PARCEL - ", 
-                     WS_CURR_PARCEL_NUM
-            SET REJECT_RES_NUM TO TRUE
-            GO TO GET_PARCEL_DATA_EXIT
-        END-IF
-    END-IF.
-
+	IF WS_CFD_COUNT > 0 THEN
+		PERFORM CHECK_PARCEL_CFDS THRU CHECK_PARCEL_CFDS_EXIT
+		IF RDB_DEADLOCK THEN
+			GO TO GET_PARCEL_DATA_EXIT
+		END-IF
+		IF WS_CFD_CANCEL_FLG = "Y" THEN
+			MOVE "CANNOT CANCEL CFD TAX" TO WS_EXCEPTION_TXT
+			DISPLAY "*** WARNING - CANNOT CANCEL CFD TAX FOR PARCEL - ", 
+				WS_CURR_PARCEL_NUM,
+				" RES #", WS_CURR_RES_NUM
+			SET REJECT_RES_NUM TO TRUE
+			GO TO GET_PARCEL_DATA_EXIT
+		END-IF
+	END-IF.
 
 	MOVE PARCEL_BOOK_MAP_ITEM IN RES_PHASE_LIST_REC TO
 		PARCEL_BOOK_MAP_ITEM IN TAX_EXT_KEY_DATA IN GET_TAX_EXT_DATA_LKG.
